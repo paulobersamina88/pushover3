@@ -1,4 +1,3 @@
-
 import io
 import zipfile
 from dataclasses import dataclass
@@ -8,538 +7,535 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Professional Pushover Dashboard", layout="wide")
+st.set_page_config(page_title="MDOF Pushover Dashboard", layout="wide")
 
-# ============================================================
-# Helper data structures
-# ============================================================
+G = 9.81
+HINGE_ORDER = ["Elastic", "Beam IO", "Beam LS", "Column IO", "Column LS", "CP", "Failed"]
+HINGE_COLOR = {
+    "Elastic": "#dbeafe",
+    "Beam IO": "#bbf7d0",
+    "Beam LS": "#86efac",
+    "Column IO": "#fde68a",
+    "Column LS": "#fca5a5",
+    "CP": "#ef4444",
+    "Failed": "#7f1d1d",
+}
+
+
 @dataclass
 class AnalysisResults:
-    displacement: np.ndarray
+    roof_disp: np.ndarray
     base_shear: np.ndarray
-    story_disp: np.ndarray
-    story_drift_ratio: np.ndarray
-    story_shear_capacity: np.ndarray
-    story_yield_disp: np.ndarray
-    story_ult_disp: np.ndarray
-    hinge_state: np.ndarray
-    story_status: list
-    target_displacement: float
-    bilinear_disp: np.ndarray
-    bilinear_shear: np.ndarray
-    effective_yield_disp: float
-    effective_yield_shear: float
-    ultimate_disp: float
-    ultimate_shear: float
-    story_force_pattern: np.ndarray
-    story_stiffness: np.ndarray
+    first_mode_shapes: np.ndarray
+    periods: np.ndarray
+    target_disp: float
+    yield_disp: float
+    yield_shear: float
+    peak_disp: float
+    peak_shear: float
+    final_disp_profile: np.ndarray
+    final_drift_ratio: np.ndarray
+    final_story_shear: np.ndarray
+    story_k_initial: np.ndarray
+    story_k_final: np.ndarray
+    beam_state: np.ndarray
+    col_state: np.ndarray
+    story_label: list
+    story_beam_m: np.ndarray
+    story_col_m: np.ndarray
+    floor_forces_target: np.ndarray
     notes: list
 
 
-# ============================================================
-# Core mechanics (improved smooth nonlinear surrogate model)
-# ============================================================
-def calc_story_stiffness(n_cols, ei_col, height, beam_factor=0.35):
-    col_part = 12.0 * np.maximum(ei_col, 1e-9) * np.maximum(n_cols, 1e-9) / np.maximum(height, 1e-6) ** 3
-    return col_part * (1.0 + beam_factor)
-
-
-def calc_story_shear_capacity(m_col, m_beam, n_cols, n_beams, height):
-    overturning_resistance = 2.0 * n_cols * np.maximum(m_col, 0.0) + 2.0 * n_beams * np.maximum(m_beam, 0.0)
-    return overturning_resistance / np.maximum(height, 1e-6)
+def default_table(n):
+    return pd.DataFrame(
+        {
+            "Storey": np.arange(1, n + 1),
+            "Height_m": [3.6] * n,
+            "Columns": [3] * n,
+            "Beams": [2] * n,
+            "EI_column_kNm2": [42670.0] * n,
+            "EI_beam_kNm2": [30000.0] * n,
+            "Mpc_kNm": [310.0] * n,
+            "Mpb_kNm": [550.0] * n,
+            "Weight_kN": [270.0] * n,
+            "Ultimate_Drift_Ratio": [0.04] * n,
+        }
+    )
 
 
 def default_force_pattern(n, pattern):
+    z = np.arange(1, n + 1, dtype=float)
     if pattern == "Uniform":
         f = np.ones(n)
     elif pattern == "Triangular":
-        f = np.arange(1, n + 1, dtype=float)
+        f = z
     elif pattern == "First-mode-like":
-        z = np.arange(1, n + 1, dtype=float)
         f = np.sin((z / (n + 1.0)) * np.pi / 2.0)
     else:
         f = np.ones(n)
+    f = np.maximum(f, 1e-12)
     return f / np.sum(f)
 
 
-def smoothstep(a, b, x):
-    """C1-smooth transition from 0 to 1."""
-    if b <= a:
-        return 1.0 if x >= b else 0.0
-    t = np.clip((x - a) / (b - a), 0.0, 1.0)
-    return t * t * (3.0 - 2.0 * t)
+def calc_story_stiffness(n_cols, n_beams, ei_col, ei_beam, height, beam_participation=0.35):
+    h = np.maximum(height, 1e-9)
+    col_k = 12.0 * np.maximum(ei_col, 1e-9) * np.maximum(n_cols, 1e-9) / (h ** 3)
+    beam_k = beam_participation * 12.0 * np.maximum(ei_beam, 1e-9) * np.maximum(n_beams, 1e-9) / (h ** 3)
+    return col_k + beam_k
 
 
-def soft_clamp(x, xmin, xmax):
-    return np.minimum(np.maximum(x, xmin), xmax)
+def assemble_shear_building_K(k_story):
+    n = len(k_story)
+    K = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        ki = k_story[i]
+        if i == 0:
+            K[i, i] += ki
+        else:
+            K[i, i] += ki
+            K[i - 1, i - 1] += ki
+            K[i, i - 1] -= ki
+            K[i - 1, i] -= ki
+    return K
 
 
-def smooth_story_force(story_disp, k_story, vy_story, dy_story, du_story, post_yield_ratio):
-    """
-    Smooth backbone replacing abrupt piecewise jumps.
-    Regions are blended using smoothstep so the global base shear-displacement
-    curve becomes much more continuous.
-
-    States returned:
-      0 Elastic
-      1 IO / post-yield onset
-      2 LS
-      3 CP / degrading
-      4 Failed / residual plateau
-    """
-    eps = 1e-9
-    dy_story = max(dy_story, eps)
-    du_story = max(du_story, 1.25 * dy_story)
-
-    d1 = dy_story
-    d2 = min(2.0 * dy_story, 0.55 * du_story)
-    d3 = min(max(0.75 * du_story, d2 + 0.25 * dy_story), 0.92 * du_story)
-    d4 = du_story
-
-    # elastic branch
-    f_el = k_story * story_disp
-
-    # smooth post-yield hardening branch
-    f_py = vy_story + post_yield_ratio * k_story * max(story_disp - d1, 0.0)
-    f_py = min(f_py, 1.08 * vy_story)
-
-    # LS plateau / mild hardening
-    f_ls = min(vy_story + 0.5 * post_yield_ratio * k_story * max(story_disp - d1, 0.0), 1.10 * vy_story)
-
-    # CP softening branch
-    cp_start = max(f_ls, 0.98 * vy_story)
-    if d4 > d3:
-        frac = soft_clamp((story_disp - d3) / (d4 - d3), 0.0, 1.0)
-    else:
-        frac = 1.0
-    f_cp = cp_start - frac * (cp_start - 0.85 * vy_story)
-
-    # residual branch after failure
-    f_res = 0.20 * vy_story
-
-    # Blend branches smoothly
-    w12 = smoothstep(d1 * 0.85, d1 * 1.15, story_disp)
-    f_12 = (1.0 - w12) * f_el + w12 * f_py
-
-    w23 = smoothstep(d2 * 0.90, d2 * 1.10, story_disp)
-    f_23 = (1.0 - w23) * f_12 + w23 * f_ls
-
-    w34 = smoothstep(d3 * 0.92, d3 * 1.08, story_disp)
-    f_34 = (1.0 - w34) * f_23 + w34 * f_cp
-
-    w45 = smoothstep(d4 * 0.98, d4 * 1.05, story_disp)
-    force = (1.0 - w45) * f_34 + w45 * f_res
-    force = max(force, 0.0)
-
-    # Tangent-like state label for display only
-    if story_disp <= 0.95 * d1:
-        state = 0
-    elif story_disp <= d2:
-        state = 1
-    elif story_disp <= d3:
-        state = 2
-    elif story_disp <= d4:
-        state = 3
-    else:
-        state = 4
-
-    return force, state
+def assemble_mass_matrix(weights_kN):
+    masses = np.maximum(np.asarray(weights_kN, dtype=float), 1e-9) / G
+    return np.diag(masses), masses
 
 
-def compute_story_displacements(roof_disp, weights):
-    """
-    Smooth displacement allocation.
-    Instead of a very sharp upper-storey concentration, this produces
-    a more realistic monotonic displacement profile.
-    """
-    weights = np.asarray(weights, dtype=float)
-    weights = np.maximum(weights, 1e-12)
-    weights = weights / np.sum(weights)
-    return roof_disp * weights
+def modal_analysis(K, M):
+    A = np.linalg.inv(M) @ K
+    vals, vecs = np.linalg.eig(A)
+    vals = np.real(vals)
+    vecs = np.real(vecs)
+    idx = np.argsort(vals)
+    vals = vals[idx]
+    vecs = vecs[:, idx]
+    vals = np.maximum(vals, 1e-12)
+    omegas = np.sqrt(vals)
+    periods = 2.0 * np.pi / omegas
+    for i in range(vecs.shape[1]):
+        if vecs[-1, i] < 0:
+            vecs[:, i] *= -1.0
+        if np.max(np.abs(vecs[:, i])) > 0:
+            vecs[:, i] /= np.max(np.abs(vecs[:, i]))
+    return periods, vecs
 
 
-def moving_average(y, window=7):
-    if window <= 1 or len(y) < window:
-        return y.copy()
-    pad = window // 2
-    ypad = np.pad(y, (pad, pad), mode="edge")
-    kernel = np.ones(window) / window
-    return np.convolve(ypad, kernel, mode="valid")
+def lateral_forces_from_u(K, u):
+    p = K @ u
+    return np.real(p)
 
 
-def run_pushover(df, pattern_name, user_pattern, n_steps, roof_disp_max, post_yield_ratio, pdelta_alpha,
-                 damping_ratio, importance_factor, smooth_window=9, internal_substeps=5):
+def story_shear_from_floor_forces(floor_forces):
+    return np.flip(np.cumsum(np.flip(floor_forces)))
+
+
+def cumulative_overturning_from_floor_forces(floor_forces, z):
+    n = len(floor_forces)
+    M = np.zeros(n)
+    z0 = np.concatenate(([0.0], z[:-1]))
+    for i in range(n):
+        arm = z[i:] - z0[i]
+        M[i] = np.sum(floor_forces[i:] * arm)
+    return M
+
+
+def classify_story(beam_state, col_state, drift_ratio, drift_cap):
+    if drift_ratio >= 1.15 * drift_cap:
+        return "Failed"
+    if col_state >= 2 or drift_ratio >= 0.90 * drift_cap:
+        return "CP"
+    if col_state == 1:
+        return "Column LS"
+    if beam_state >= 2:
+        return "Beam LS"
+    if col_state == 0 and beam_state == 1:
+        return "Beam IO"
+    if col_state == 1 and beam_state == 0:
+        return "Column IO"
+    return "Elastic"
+
+
+def degrade_story_stiffness(k0, beam_state, col_state, drift_ratio, drift_cap):
+    factor = 1.0
+    if beam_state == 1:
+        factor *= 0.80
+    elif beam_state >= 2:
+        factor *= 0.60
+
+    if col_state == 1:
+        factor *= 0.55
+    elif col_state >= 2:
+        factor *= 0.25
+
+    if drift_ratio >= drift_cap:
+        factor *= 0.50
+    elif drift_ratio >= 0.75 * drift_cap:
+        factor *= 0.80
+
+    return max(0.05 * k0, factor * k0)
+
+
+def run_mdof_pushover(
+    df,
+    pattern_name,
+    user_pattern,
+    roof_disp_max,
+    n_steps,
+    beam_participation,
+    pdelta_alpha,
+    mode_update_every,
+):
     n = len(df)
     h = df["Height_m"].to_numpy(dtype=float)
     n_cols = df["Columns"].to_numpy(dtype=float)
     n_beams = df["Beams"].to_numpy(dtype=float)
     ei_col = df["EI_column_kNm2"].to_numpy(dtype=float)
-    mcol = df["Mpc_kNm"].to_numpy(dtype=float)
-    mbeam = df["Mpb_kNm"].to_numpy(dtype=float)
+    ei_beam = df["EI_beam_kNm2"].to_numpy(dtype=float)
+    mpc = df["Mpc_kNm"].to_numpy(dtype=float)
+    mpb = df["Mpb_kNm"].to_numpy(dtype=float)
     w = df["Weight_kN"].to_numpy(dtype=float)
+    drift_cap = df["Ultimate_Drift_Ratio"].to_numpy(dtype=float)
 
-    k_story = calc_story_stiffness(n_cols=n_cols, ei_col=ei_col, height=h)
-    vy_story = calc_story_shear_capacity(m_col=mcol, m_beam=mbeam, n_cols=n_cols, n_beams=n_beams, height=h)
-    dy_story = vy_story / np.maximum(k_story, 1e-9)
-    du_story = df["Ultimate_Drift_Ratio"].to_numpy(dtype=float) * h
+    k0 = calc_story_stiffness(n_cols, n_beams, ei_col, ei_beam, h, beam_participation=beam_participation)
+    k_story = k0.copy()
+
+    Mmat, masses = assemble_mass_matrix(w)
+    z = np.cumsum(h)
 
     if pattern_name == "User-defined":
-        f = np.asarray(user_pattern, dtype=float)
-        f = np.where(f < 0, 0, f)
-        if np.sum(f) <= 0:
-            f = np.ones(n)
-        f = f / np.sum(f)
+        patt = np.asarray(user_pattern, dtype=float)
+        patt = np.maximum(patt, 0.0)
+        if np.sum(patt) <= 0:
+            patt = np.ones(n)
+        patt = patt / np.sum(patt)
     else:
-        f = default_force_pattern(n, pattern_name)
+        patt = default_force_pattern(n, pattern_name)
 
-    z = np.cumsum(h)
-    # Smoother displacement weights than previous version
-    disp_weights = 0.45 * f + 0.55 * (z / np.max(z))
-    disp_weights = np.maximum(disp_weights, 1e-12)
-    disp_weights = disp_weights / np.sum(disp_weights)
+    roof_hist = np.linspace(0.0, roof_disp_max, n_steps)
+    base_hist = np.zeros(n_steps)
+    mode_hist = np.zeros((n_steps, n))
 
-    # Internal substeps make the response much smoother even when the UI uses fewer visible steps
-    n_internal = max(int(n_steps) * int(max(1, internal_substeps)), int(n_steps))
-    roof_disp_internal = np.linspace(0.0, roof_disp_max, n_internal)
-    base_shear_internal = np.zeros_like(roof_disp_internal)
-    story_disp_hist_internal = np.zeros((n_internal, n))
-    hinge_state_hist_internal = np.zeros((n_internal, n), dtype=int)
+    beam_state = np.zeros(n, dtype=int)  # 0 elastic, 1 IO, 2 LS+
+    col_state = np.zeros(n, dtype=int)
 
-    cumulative_weight = np.flip(np.cumsum(np.flip(w)))
+    floor_force_hist = np.zeros((n_steps, n))
+    disp_hist = np.zeros((n_steps, n))
+    story_shear_hist = np.zeros((n_steps, n))
+    beam_m_hist = np.zeros((n_steps, n))
+    col_m_hist = np.zeros((n_steps, n))
 
-    for j, d_roof in enumerate(roof_disp_internal):
-        story_disp = compute_story_displacements(d_roof, disp_weights)
-        story_force = np.zeros(n)
-        states = np.zeros(n, dtype=int)
+    periods, modes = modal_analysis(assemble_shear_building_K(k_story), Mmat)
+    phi = modes[:, 0].copy()
+    phi /= max(phi[-1], 1e-9)
 
-        drift_ratio = np.maximum(story_disp / np.maximum(h, 1e-6), 0.0)
+    yielded_once = False
+    yield_disp = None
+    yield_shear = None
 
-        # Smooth P-delta reduction instead of abrupt clipping
-        theta = pdelta_alpha * cumulative_weight * drift_ratio / np.maximum(vy_story, 1e-6)
-        reduction = 1.0 - 0.55 * (1.0 - np.exp(-theta))
-        reduction = np.clip(reduction, 0.45, 1.0)
+    for j, roof_d in enumerate(roof_hist):
+        if j == 0 or (mode_update_every > 0 and j % mode_update_every == 0):
+            periods, modes = modal_analysis(assemble_shear_building_K(k_story), Mmat)
+            phi = modes[:, 0].copy()
+            phi /= max(phi[-1], 1e-9)
+
+        u = roof_d * phi
+        floor_forces = lateral_forces_from_u(assemble_shear_building_K(k_story), u)
+        story_shear = story_shear_from_floor_forces(floor_forces)
+        overturn = cumulative_overturning_from_floor_forces(floor_forces, z)
+        drift = np.zeros(n)
+        drift[0] = u[0] / max(h[0], 1e-9)
+        for i in range(1, n):
+            drift[i] = (u[i] - u[i - 1]) / max(h[i], 1e-9)
+
+        pdelta_factor = 1.0 / (1.0 + pdelta_alpha * np.maximum(np.abs(drift) / np.maximum(drift_cap, 1e-9), 0.0))
+        pdelta_factor = np.clip(pdelta_factor, 0.55, 1.0)
+        floor_forces *= pdelta_factor
+        story_shear = story_shear_from_floor_forces(floor_forces)
+        overturn = cumulative_overturning_from_floor_forces(floor_forces, z)
+
+        beam_m = np.abs(story_shear * h / np.maximum(2.0 * np.maximum(n_beams, 1.0), 1.0))
+        col_m = np.abs(overturn / np.maximum(np.maximum(n_cols, 1.0), 1.0))
 
         for i in range(n):
-            force_i, state_i = smooth_story_force(
-                story_disp=story_disp[i],
-                k_story=k_story[i],
-                vy_story=vy_story[i] * reduction[i],
-                dy_story=dy_story[i],
-                du_story=du_story[i],
-                post_yield_ratio=post_yield_ratio,
-            )
-            story_force[i] = force_i
-            states[i] = state_i
+            if beam_m[i] >= 0.85 * mpb[i]:
+                beam_state[i] = max(beam_state[i], 1)
+            if beam_m[i] >= 1.00 * mpb[i]:
+                beam_state[i] = max(beam_state[i], 2)
 
-        story_disp_hist_internal[j, :] = story_disp
-        hinge_state_hist_internal[j, :] = states
-        base_shear_internal[j] = np.sum(story_force)
+            if col_m[i] >= 0.80 * mpc[i]:
+                col_state[i] = max(col_state[i], 1)
+            if col_m[i] >= 1.00 * mpc[i]:
+                col_state[i] = max(col_state[i], 2)
 
-    # Optional light smoothing of plotted curve only
-    base_shear_internal_smooth = moving_average(base_shear_internal, window=smooth_window)
+            k_story[i] = degrade_story_stiffness(k0[i], beam_state[i], col_state[i], abs(drift[i]), drift_cap[i])
 
-    # Sample back to user-visible step count while preserving a smooth curve
-    visible_idx = np.linspace(0, n_internal - 1, n_steps).astype(int)
-    roof_disp = roof_disp_internal[visible_idx]
-    base_shear = base_shear_internal_smooth[visible_idx]
-    story_disp_hist = story_disp_hist_internal[visible_idx, :]
-    hinge_state_hist = hinge_state_hist_internal[visible_idx, :]
+        if not yielded_once and (np.any(beam_state > 0) or np.any(col_state > 0)):
+            yielded_once = True
+            yield_disp = roof_d
+            yield_shear = float(np.sum(floor_forces))
 
-    idx_peak = int(np.argmax(base_shear))
-    peak_v = float(base_shear[idx_peak])
-    peak_d = float(roof_disp[idx_peak])
+        periods, modes = modal_analysis(assemble_shear_building_K(k_story), Mmat)
+        phi = modes[:, 0].copy()
+        phi /= max(phi[-1], 1e-9)
 
-    initial_k = np.sum(k_story * disp_weights)
-    if initial_k <= 0:
-        initial_k = 1.0
+        u = roof_d * phi
+        floor_forces = lateral_forces_from_u(assemble_shear_building_K(k_story), u)
+        drift = np.zeros(n)
+        drift[0] = u[0] / max(h[0], 1e-9)
+        for i in range(1, n):
+            drift[i] = (u[i] - u[i - 1]) / max(h[i], 1e-9)
+        pdelta_factor = 1.0 / (1.0 + pdelta_alpha * np.maximum(np.abs(drift) / np.maximum(drift_cap, 1e-9), 0.0))
+        pdelta_factor = np.clip(pdelta_factor, 0.55, 1.0)
+        floor_forces *= pdelta_factor
+        story_shear = story_shear_from_floor_forces(floor_forces)
+        overturn = cumulative_overturning_from_floor_forces(floor_forces, z)
+        beam_m = np.abs(story_shear * h / np.maximum(2.0 * np.maximum(n_beams, 1.0), 1.0))
+        col_m = np.abs(overturn / np.maximum(np.maximum(n_cols, 1.0), 1.0))
 
-    dy_eff = min(peak_v / initial_k, peak_d if peak_d > 0 else roof_disp_max * 0.25)
-    bilinear_disp = np.array([0.0, dy_eff, roof_disp_max])
+        roof_hist[j] = roof_d
+        base_hist[j] = float(np.sum(floor_forces))
+        mode_hist[j, :] = phi
+        floor_force_hist[j, :] = floor_forces
+        disp_hist[j, :] = u
+        story_shear_hist[j, :] = story_shear
+        beam_m_hist[j, :] = beam_m
+        col_m_hist[j, :] = col_m
 
-    post_k_eff = (base_shear[-1] - peak_v) / max(roof_disp_max - max(dy_eff, peak_d), 1e-9)
-    end_shear = max(peak_v + post_k_eff * (roof_disp_max - dy_eff), 0.0)
-    bilinear_shear = np.array([0.0, peak_v, end_shear])
+    peak_idx = int(np.argmax(base_hist))
+    peak_disp = float(roof_hist[peak_idx])
+    peak_shear = float(base_hist[peak_idx])
 
-    mu = max(roof_disp_max / max(dy_eff, 1e-9), 1.0)
-    c_damp = 1.0 + 2.5 * damping_ratio
-    c_imp = importance_factor
-    target_displacement = min(roof_disp_max, dy_eff * mu ** 0.6 * c_damp * c_imp)
+    if yield_disp is None:
+        yield_disp = peak_disp * 0.6
+        yield_shear = peak_shear * 0.75
 
-    idx_target = int(np.argmin(np.abs(roof_disp - target_displacement)))
-    final_story_disp = story_disp_hist[idx_target, :]
-    final_drift_ratio = final_story_disp / np.maximum(h, 1e-9)
-    final_hinge = hinge_state_hist[idx_target, :]
+    mu = max(roof_disp_max / max(yield_disp, 1e-9), 1.0)
+    target_disp = min(roof_disp_max, yield_disp * mu ** 0.6)
+    tgt_idx = int(np.argmin(np.abs(roof_hist - target_disp)))
 
-    story_status = []
-    for val in final_hinge:
-        story_status.append({0: "Elastic", 1: "IO", 2: "LS", 3: "CP", 4: "Failed"}.get(int(val), "?"))
+    story_label = []
+    for i in range(n):
+        story_label.append(classify_story(beam_state[i], col_state[i], abs(disp_hist[tgt_idx, i] - (disp_hist[tgt_idx, i-1] if i > 0 else 0.0)) / h[i], drift_cap[i]))
+
+    final_drift = np.zeros(n)
+    final_drift[0] = disp_hist[tgt_idx, 0] / max(h[0], 1e-9)
+    for i in range(1, n):
+        final_drift[i] = (disp_hist[tgt_idx, i] - disp_hist[tgt_idx, i - 1]) / max(h[i], 1e-9)
 
     notes = [
-        "This version uses a smoother nonlinear surrogate backbone, internal substepping, and smooth P-delta degradation.",
-        "The smoother pushover curve is closer visually to commercial software output, but it is still not a full nonlinear FEM solver.",
-        "For SAP2000/SeismoBuild-like mechanics, the next upgrade is tangent-stiffness iteration with member-by-member hinge updating.",
+        "This upgrade replaces the imposed displacement weights with a true shear-building MDOF stiffness and mass model.",
+        "The first mode is recomputed as stiffness degrades, so hinge progression is influenced by evolving modal behavior.",
+        "Beam and column yielding are still approximate story-level checks, not full member-end fiber or plastic-hinge elements.",
+        "Base-first yielding is now more likely when overturning demand concentrates in the lower stories, similar to commercial nonlinear solvers.",
     ]
 
     return AnalysisResults(
-        displacement=roof_disp,
-        base_shear=base_shear,
-        story_disp=final_story_disp,
-        story_drift_ratio=final_drift_ratio,
-        story_shear_capacity=vy_story,
-        story_yield_disp=dy_story,
-        story_ult_disp=du_story,
-        hinge_state=final_hinge,
-        story_status=story_status,
-        target_displacement=target_displacement,
-        bilinear_disp=bilinear_disp,
-        bilinear_shear=bilinear_shear,
-        effective_yield_disp=dy_eff,
-        effective_yield_shear=peak_v,
-        ultimate_disp=float(roof_disp[-1]),
-        ultimate_shear=float(base_shear[-1]),
-        story_force_pattern=f,
-        story_stiffness=k_story,
+        roof_disp=roof_hist,
+        base_shear=base_hist,
+        first_mode_shapes=mode_hist,
+        periods=periods,
+        target_disp=target_disp,
+        yield_disp=float(yield_disp),
+        yield_shear=float(yield_shear),
+        peak_disp=peak_disp,
+        peak_shear=peak_shear,
+        final_disp_profile=disp_hist[tgt_idx, :],
+        final_drift_ratio=final_drift,
+        final_story_shear=story_shear_hist[tgt_idx, :],
+        story_k_initial=k0,
+        story_k_final=k_story.copy(),
+        beam_state=beam_state.copy(),
+        col_state=col_state.copy(),
+        story_label=story_label,
+        story_beam_m=beam_m_hist[tgt_idx, :],
+        story_col_m=col_m_hist[tgt_idx, :],
+        floor_forces_target=floor_force_hist[tgt_idx, :],
         notes=notes,
     )
-
-
-# ============================================================
-# UI utilities
-# ============================================================
-def default_table(n_storey):
-    return pd.DataFrame({
-        "Storey": np.arange(1, n_storey + 1),
-        "Height_m": [3.0] * n_storey,
-        "Columns": [4] * n_storey,
-        "Beams": [4] * n_storey,
-        "EI_column_kNm2": [2.5e5] * n_storey,
-        "Mpc_kNm": [280.0] * n_storey,
-        "Mpb_kNm": [220.0] * n_storey,
-        "Weight_kN": [900.0] * n_storey,
-        "Ultimate_Drift_Ratio": [0.04] * n_storey,
-    })
-
-
-def hinge_color(state):
-    return {
-        0: "#dbeafe",
-        1: "#bbf7d0",
-        2: "#fde68a",
-        3: "#fca5a5",
-        4: "#991b1b",
-    }.get(int(state), "#e5e7eb")
 
 
 def to_excel_bytes(inputs_df, results_df, summary_df):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         inputs_df.to_excel(writer, index=False, sheet_name="Inputs")
-        results_df.to_excel(writer, index=False, sheet_name="Results")
+        results_df.to_excel(writer, index=False, sheet_name="Story_Results")
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
     return buffer.getvalue()
 
 
 def to_zip_bytes(inputs_df, results_df, summary_df):
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("inputs.csv", inputs_df.to_csv(index=False))
-        zf.writestr("results.csv", results_df.to_csv(index=False))
+        zf.writestr("story_results.csv", results_df.to_csv(index=False))
         zf.writestr("summary.csv", summary_df.to_csv(index=False))
-    return zip_buffer.getvalue()
+    return buffer.getvalue()
 
 
-# ============================================================
-# Main app
-# ============================================================
-st.title("Professional Nonlinear Pushover Dashboard for RC/Steel Frames")
-st.caption("Educational nonlinear pushover simulator with smoother capacity curve behavior, hinge states, bilinear idealization, target displacement, drift checks, soft-storey screening, and export tools.")
+st.title("MDOF Nonlinear Pushover Dashboard")
+st.caption("Shear-building MDOF upgrade with modal analysis, adaptive first-mode displacement shape, approximate beam/column yielding, and degrading story stiffness.")
 
 with st.sidebar:
     st.header("Model Setup")
-    n_storey = st.slider("Number of Storeys", 1, 10, 5)
-    pattern_name = st.selectbox("Lateral Load Pattern", ["Uniform", "Triangular", "First-mode-like", "User-defined"])
-    roof_disp_max = st.number_input("Maximum Roof Displacement (m)", min_value=0.01, value=0.30, step=0.01)
-    n_steps = st.slider("Pushover Steps", 30, 300, 120, 10)
-    post_yield_ratio = st.slider("Post-Yield Stiffness Ratio", 0.00, 0.20, 0.03, 0.01)
-    pdelta_alpha = st.slider("P-Delta Severity Factor", 0.00, 0.20, 0.04, 0.01)
-    damping_ratio = st.slider("Equivalent Damping Ratio", 0.02, 0.20, 0.05, 0.01)
-    importance_factor = st.slider("Importance / Amplification Factor", 0.80, 1.50, 1.00, 0.05)
-    smooth_window = st.slider("Curve Smoothing Window", 1, 21, 9, 2)
-    internal_substeps = st.slider("Internal Substeps per Visible Step", 1, 10, 5, 1)
+    n_storey = st.slider("Number of Storeys", 1, 15, 5)
+    pattern_name = st.selectbox("Reference Lateral Pattern", ["Uniform", "Triangular", "First-mode-like", "User-defined"], index=2)
+    roof_disp_max = st.number_input("Maximum Roof Displacement (m)", min_value=0.01, value=0.60, step=0.01)
+    n_steps = st.slider("Pushover Steps", 20, 300, 120, 10)
+    beam_participation = st.slider("Beam Stiffness Participation Factor", 0.00, 1.00, 0.35, 0.05)
+    pdelta_alpha = st.slider("P-Delta Severity Factor", 0.00, 0.40, 0.06, 0.01)
+    mode_update_every = st.slider("Recompute Mode Every N Steps", 1, 20, 2, 1)
 
 st.subheader("Storey-by-Storey Frame Properties")
-st.write("Enter section or capacity-related properties per storey. EI and plastic moments are interpreted here as equivalent storey-level values.")
+st.write("Enter equivalent story properties. Unlike the previous version, this upgrade explicitly forms a mass matrix, story stiffness matrix, and evolving first mode shape.")
 
-if "table" not in st.session_state or len(st.session_state.table) != n_storey:
-    st.session_state.table = default_table(n_storey)
+if "table_mdof" not in st.session_state or len(st.session_state.table_mdof) != n_storey:
+    st.session_state.table_mdof = default_table(n_storey)
 
 edited_df = st.data_editor(
-    st.session_state.table,
+    st.session_state.table_mdof,
     num_rows="fixed",
     use_container_width=True,
-    key="pushover_table",
+    key="mdof_table",
     column_config={
         "Storey": st.column_config.NumberColumn(disabled=True),
         "Height_m": st.column_config.NumberColumn("Height (m)", min_value=2.0, step=0.1),
         "Columns": st.column_config.NumberColumn("No. of Columns", min_value=1, step=1),
         "Beams": st.column_config.NumberColumn("No. of Beams", min_value=1, step=1),
         "EI_column_kNm2": st.column_config.NumberColumn("Column EI (kN·m²)", min_value=1.0),
-        "Mpc_kNm": st.column_config.NumberColumn("Column Plastic Moment, Mpc (kN·m)", min_value=1.0),
-        "Mpb_kNm": st.column_config.NumberColumn("Beam Plastic Moment, Mpb (kN·m)", min_value=1.0),
+        "EI_beam_kNm2": st.column_config.NumberColumn("Beam EI (kN·m²)", min_value=1.0),
+        "Mpc_kNm": st.column_config.NumberColumn("Column Plastic Moment Mpc (kN·m)", min_value=1.0),
+        "Mpb_kNm": st.column_config.NumberColumn("Beam Plastic Moment Mpb (kN·m)", min_value=1.0),
         "Weight_kN": st.column_config.NumberColumn("Storey Seismic Weight (kN)", min_value=1.0),
         "Ultimate_Drift_Ratio": st.column_config.NumberColumn("Ultimate Drift Ratio", min_value=0.005, max_value=0.15, step=0.005),
     },
 )
-st.session_state.table = edited_df.copy()
+st.session_state.table_mdof = edited_df.copy()
 
 user_pattern = None
 if pattern_name == "User-defined":
-    st.subheader("User-Defined Lateral Force Pattern")
-    user_pat_df = pd.DataFrame({"Storey": np.arange(1, n_storey + 1), "Relative Force": [1.0] * n_storey})
-    user_pat_df = st.data_editor(user_pat_df, num_rows="fixed", use_container_width=True, key="pattern_table")
-    user_pattern = user_pat_df["Relative Force"].to_numpy(dtype=float)
+    st.subheader("User-Defined Floor Force Pattern")
+    pat_df = pd.DataFrame({"Storey": np.arange(1, n_storey + 1), "Relative Force": [1.0] * n_storey})
+    pat_df = st.data_editor(pat_df, num_rows="fixed", use_container_width=True, key="user_pat_mdof")
+    user_pattern = pat_df["Relative Force"].to_numpy(dtype=float)
 
-run = st.button("Run Professional Pushover Analysis", type="primary")
+run = st.button("Run MDOF Pushover Analysis", type="primary")
 
 if run:
-    df = edited_df.copy()
-    results = run_pushover(
-        df=df,
+    results = run_mdof_pushover(
+        edited_df.copy(),
         pattern_name=pattern_name,
         user_pattern=user_pattern,
-        n_steps=n_steps,
         roof_disp_max=roof_disp_max,
-        post_yield_ratio=post_yield_ratio,
+        n_steps=n_steps,
+        beam_participation=beam_participation,
         pdelta_alpha=pdelta_alpha,
-        damping_ratio=damping_ratio,
-        importance_factor=importance_factor,
-        smooth_window=smooth_window,
-        internal_substeps=internal_substeps,
+        mode_update_every=mode_update_every,
     )
 
-    results_df = pd.DataFrame({
-        "Storey": df["Storey"],
-        "Height_m": df["Height_m"],
-        "Story_Stiffness_kN_per_m": results.story_stiffness,
-        "Shear_Capacity_kN": results.story_shear_capacity,
-        "Yield_Displacement_m": results.story_yield_disp,
-        "Ultimate_Displacement_m": results.story_ult_disp,
-        "Target_Story_Displacement_m": results.story_disp,
-        "Target_Drift_Ratio": results.story_drift_ratio,
-        "Hinge_State": results.story_status,
-        "Force_Pattern": results.story_force_pattern,
-    })
+    results_df = pd.DataFrame(
+        {
+            "Storey": edited_df["Storey"],
+            "Height_m": edited_df["Height_m"],
+            "K_initial_kN_per_m": results.story_k_initial,
+            "K_final_kN_per_m": results.story_k_final,
+            "Disp_at_Target_m": results.final_disp_profile,
+            "Drift_Ratio_at_Target": results.final_drift_ratio,
+            "Story_Shear_at_Target_kN": results.final_story_shear,
+            "Beam_Moment_Demand_kNm": results.story_beam_m,
+            "Column_Moment_Demand_kNm": results.story_col_m,
+            "Beam_State": results.beam_state,
+            "Column_State": results.col_state,
+            "Story_Label": results.story_label,
+            "Floor_Force_at_Target_kN": results.floor_forces_target,
+        }
+    )
 
-    soft_storey_limit = 0.70 * np.max(results.story_stiffness)
-    results_df["Soft_Storey_Flag"] = np.where(results.story_stiffness < soft_storey_limit, "Possible", "No")
-
-    summary_df = pd.DataFrame({
-        "Metric": [
-            "Peak Base Shear (kN)",
-            "Effective Yield Displacement (m)",
-            "Target Roof Displacement (m)",
-            "Ultimate Roof Displacement Considered (m)",
-            "Base Shear at Final Step (kN)",
-            "Max Story Drift Ratio at Target",
-            "No. of Storeys at LS or Worse",
-            "No. of Storeys at CP or Failed",
-        ],
-        "Value": [
-            results.effective_yield_shear,
-            results.effective_yield_disp,
-            results.target_displacement,
-            results.ultimate_disp,
-            results.ultimate_shear,
-            np.max(results.story_drift_ratio),
-            int(np.sum(np.isin(results.hinge_state, [2, 3, 4]))),
-            int(np.sum(np.isin(results.hinge_state, [3, 4]))),
-        ],
-    })
+    summary_df = pd.DataFrame(
+        {
+            "Metric": [
+                "First-mode Period T1 (s)",
+                "Yield Roof Displacement (m)",
+                "Yield Base Shear (kN)",
+                "Peak Roof Displacement (m)",
+                "Peak Base Shear (kN)",
+                "Target Roof Displacement (m)",
+                "Maximum Drift Ratio at Target",
+                "Stories at CP/Failed",
+            ],
+            "Value": [
+                results.periods[0],
+                results.yield_disp,
+                results.yield_shear,
+                results.peak_disp,
+                results.peak_shear,
+                results.target_disp,
+                float(np.max(np.abs(results.final_drift_ratio))),
+                int(np.sum(np.isin(results.story_label, ["CP", "Failed"]))),
+            ],
+        }
+    )
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Peak Base Shear", f"{results.effective_yield_shear:,.1f} kN")
-    c2.metric("Target Roof Disp.", f"{results.target_displacement:.4f} m")
-    c3.metric("Max Drift Ratio", f"{np.max(results.story_drift_ratio):.4f}")
-    c4.metric("Critical Hinge Level", max(results.story_status, key=lambda x: ["Elastic", "IO", "LS", "CP", "Failed"].index(x)))
+    c1.metric("T1", f"{results.periods[0]:.3f} s")
+    c2.metric("Yield Base Shear", f"{results.yield_shear:,.1f} kN")
+    c3.metric("Peak Base Shear", f"{results.peak_shear:,.1f} kN")
+    c4.metric("Critical Story State", max(results.story_label, key=lambda x: HINGE_ORDER.index(x)))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Capacity Curve",
-        "Storey Results",
-        "Hinge Map",
-        "Checks & Interpretation",
-        "Downloads",
-    ])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Capacity Curve", "Mode Shape", "Story Results", "Hinge Map", "Downloads"])
 
     with tab1:
         fig1, ax1 = plt.subplots(figsize=(8, 5))
-        ax1.plot(results.displacement, results.base_shear, linewidth=2.2, label="Smoothed Pushover Curve")
-        ax1.plot(results.bilinear_disp, results.bilinear_shear, linestyle="--", linewidth=2, label="Idealized Bilinear")
-        ax1.axvline(results.target_displacement, linestyle=":", linewidth=2, label="Target Displacement")
+        ax1.plot(results.roof_disp, results.base_shear, linewidth=2.2, label="MDOF Pushover Curve")
+        ax1.axvline(results.target_disp, linestyle=":", linewidth=2, label="Target Displacement")
+        ax1.scatter([results.yield_disp], [results.yield_shear], label="First Yield")
+        ax1.scatter([results.peak_disp], [results.peak_shear], label="Peak")
         ax1.set_xlabel("Roof Displacement (m)")
         ax1.set_ylabel("Base Shear (kN)")
-        ax1.set_title("Nonlinear Pushover Capacity Curve")
+        ax1.set_title("Adaptive-Mode MDOF Pushover Curve")
         ax1.grid(True)
         ax1.legend()
         st.pyplot(fig1)
 
         fig2, ax2 = plt.subplots(figsize=(8, 5))
-        ax2.bar(results_df["Storey"].astype(str), results_df["Target_Drift_Ratio"])
+        ax2.bar(results_df["Storey"].astype(str), np.abs(results_df["Drift_Ratio_at_Target"]))
         ax2.set_xlabel("Storey")
         ax2.set_ylabel("Drift Ratio")
-        ax2.set_title("Interstorey Drift Ratio at Target Displacement")
+        ax2.set_title("Storey Drift Ratio at Target Displacement")
         ax2.grid(True, axis="y")
         st.pyplot(fig2)
 
     with tab2:
-        st.dataframe(results_df, use_container_width=True)
-        st.dataframe(summary_df, use_container_width=True)
+        fig3, ax3 = plt.subplots(figsize=(6, 6))
+        current_mode = results.first_mode_shapes[min(len(results.first_mode_shapes) - 1, np.argmin(np.abs(results.roof_disp - results.target_disp))), :]
+        z = np.cumsum(edited_df["Height_m"].to_numpy(dtype=float))
+        ax3.plot(current_mode, z, marker="o")
+        ax3.set_xlabel("Normalized First Mode Shape")
+        ax3.set_ylabel("Elevation (m)")
+        ax3.set_title("First Mode Shape at Target Displacement")
+        ax3.grid(True)
+        st.pyplot(fig3)
 
     with tab3:
-        st.write("Hinge State Legend: Elastic, IO, LS, CP, Failed")
+        st.dataframe(results_df, use_container_width=True)
+        st.dataframe(summary_df, use_container_width=True)
+        for note in results.notes:
+            st.caption(note)
+
+    with tab4:
         cols = st.columns(len(results_df))
         for i, row in results_df.iterrows():
+            label = row["Story_Label"]
             with cols[i]:
                 st.markdown(
-                    f"<div style='padding:18px;border-radius:10px;background:{hinge_color(results.hinge_state[i])};text-align:center;color:#111;'>"
-                    f"<b>Storey {int(row['Storey'])}</b><br>{row['Hinge_State']}"
+                    f"<div style='padding:18px;border-radius:10px;background:{HINGE_COLOR[label]};text-align:center;color:#111;'>"
+                    f"<b>Storey {int(row['Storey'])}</b><br>{label}<br>Beam={int(row['Beam_State'])}, Col={int(row['Column_State'])}"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
-
-    with tab4:
-        st.subheader("Engineering Checks")
-        drift_limit_io = 0.01
-        drift_limit_ls = 0.02
-        drift_limit_cp = 0.04
-
-        interp = []
-        max_drift = float(np.max(results.story_drift_ratio))
-        if max_drift <= drift_limit_io:
-            interp.append("Overall drift demand is within a typical Immediate Occupancy range.")
-        elif max_drift <= drift_limit_ls:
-            interp.append("Overall drift demand has entered a typical Life Safety range.")
-        elif max_drift <= drift_limit_cp:
-            interp.append("Overall drift demand is approaching or within a Collapse Prevention range.")
-        else:
-            interp.append("Overall drift demand exceeds a common Collapse Prevention screening limit.")
-
-        softies = results_df.loc[results_df["Soft_Storey_Flag"] == "Possible", "Storey"].tolist()
-        if softies:
-            interp.append(f"Possible soft-storey behavior detected at storey/storeys: {', '.join(map(str, softies))}.")
-        else:
-            interp.append("No obvious soft-storey flag based on relative stiffness screening.")
-
-        severe = results_df.loc[results_df["Hinge_State"].isin(["CP", "Failed"]), "Storey"].tolist()
-        if severe:
-            interp.append(f"Storey/storeys with CP or failed hinge state at target displacement: {', '.join(map(str, severe))}.")
-        else:
-            interp.append("No storey reached CP or failed state at the selected target displacement.")
-
-        for item in interp:
-            st.write(f"- {item}")
-        st.info("Interpretation is screening-level only. Use a detailed nonlinear model for design decisions.")
-        for note in results.notes:
-            st.caption(note)
 
     with tab5:
         excel_bytes = to_excel_bytes(edited_df, results_df, summary_df)
@@ -547,15 +543,15 @@ if run:
         st.download_button(
             "Download Excel Results",
             data=excel_bytes,
-            file_name="pushover_results.xlsx",
+            file_name="mdof_pushover_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         st.download_button(
             "Download CSV ZIP Bundle",
             data=zip_bytes,
-            file_name="pushover_results_bundle.zip",
+            file_name="mdof_pushover_results_bundle.zip",
             mime="application/zip",
         )
 
 st.markdown("---")
-st.write("Suggested next upgrade: tangent-stiffness iteration + element-by-element hinges + FEMA/ASCE performance point option + OpenSees comparison mode.")
+st.write("Next logical upgrade: frame-element stiffness assembly with member-end rotational springs and tangent-stiffness iteration against SeismoBuild/OpenSees benchmarks.")
